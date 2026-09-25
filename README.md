@@ -1,5 +1,6 @@
 <div align="center">
 <h1>Déjà View: Looping Transformers for Multi-View 3D Reconstruction</h1>
+<h3>NeurIPS 2026 · Oral</h3>
 
 <a href="https://research.nvidia.com/labs/dvl/projects/dvlt/"><img src="https://img.shields.io/badge/Project-Page-1f72b1.svg" alt="Project Page"></a>
 <a href="https://arxiv.org/abs/2605.30215"><img src="https://img.shields.io/badge/arXiv-2605.30215-b31b1b.svg" alt="arXiv"></a>
