@@ -47,25 +47,6 @@ See [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) §"Upstream packages
 used for evaluation" for license details — verify each upstream's terms suit
 your use case before installing.
 
-## Data backend (`dataverse`)
-
-DVLT's dataset parsers depend on the `dataverse` package.
-
-```bash
-git clone <YOUR-DATAVERSE-REMOTE>.git third_party/dataverse
-pip install -e third_party/dataverse
-```
-
-Some datasets need extra dependencies — install the matching extras as needed,
-for example:
-
-```bash
-pip install -e 'third_party/dataverse[kubric]'
-```
-
-The Gradio demos and `dvlt.scripts.visualize` work without `dataverse`; the
-full training stack does not.
-
 ## Sanity check
 
 ```bash
