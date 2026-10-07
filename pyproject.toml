@@ -46,6 +46,7 @@ dependencies = [
     "rerun-sdk==0.24.1",
     # 3D geometry (ICP, voxel downsampling)
     "open3d==0.19.0",
+    "plyfile>=1.0,<2",
 ]
 
 [project.optional-dependencies]

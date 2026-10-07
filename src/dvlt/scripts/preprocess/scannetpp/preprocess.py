@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Preprocess ScanNet++ DSLR captures into undistorted images + rendered metric depth.
+"""Preprocess ScanNet++ DSLR captures into undistorted RGB, depth and structure masks.
 
 Reads the raw release (``data/`` + ``splits/``) and writes the layout the dataset
 configs expect, relative to ``user.data_root``:
@@ -11,12 +11,14 @@ configs' ``user.data_root`` at ``--output_root`` after running.
 Expected ``--data_root`` layout (official ScanNet++ release)::
 
     data_root/
+    ├── metadata/semantic_classes.txt               # wall/floor/ceiling class IDs
     ├── splits/
     │   ├── nvs_sem_train.txt              # scene ids, one per line
     │   └── nvs_sem_val.txt
     └── data/
         └── <SCENE_ID>/
             ├── scans/mesh_aligned_0.05.ply        # GT mesh (depth source)
+            ├── scans/mesh_aligned_0.05_semantic.ply  # per-vertex semantic IDs
             └── dslr/
                 ├── resized_images/*.JPG           # fisheye RGB
                 ├── colmap/images.txt              # world-to-camera poses
@@ -42,7 +44,7 @@ from dvlt.scripts.preprocess.scannetpp.processor import SPLIT_TO_SUBSET, ScanNet
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="ScanNet++ DSLR depth-render + undistort preprocessing")
+    parser = argparse.ArgumentParser(description="ScanNet++ DSLR depth, structure + undistort preprocessing")
     parser.add_argument(
         "--data_root",
         type=str,
@@ -91,11 +93,6 @@ def parse_args():
             "renders much faster, but too small silently drops faces and corrupts depth"
         ),
     )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Re-render scenes even if outputs already exist",
-    )
     return parser.parse_args()
 
 
@@ -107,7 +104,6 @@ def main():
         splits=args.splits,
         scene_ids=args.scene_ids,
         device=args.device,
-        overwrite=args.overwrite,
         bin_size=args.bin_size,
         max_faces_per_bin=args.max_faces_per_bin,
     )

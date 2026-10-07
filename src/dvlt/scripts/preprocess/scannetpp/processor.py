@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""ScanNet++ DSLR preprocessing: render mesh depth and undistort to a pinhole model.
+"""ScanNet++ DSLR preprocessing: render depth and structure, then undistort.
 
 Per frame, depth is rasterized from the aligned GT mesh through the original
 fisheye camera with PyTorch3D, then both the RGB and the depth are rectified to a
@@ -12,6 +12,7 @@ Output per scene, under ``{output_root}/{subset}/scannetpp/scannetpp_undistort/{
 
     undistorted_images/<name>.JPG
     undistorted_depth/<name>.png            # 16-bit, float16 bit-pattern (see common.io.read_depth)
+    struct_mask/<name>.png                   # uint8: 0 other, 1 wall, 2 floor, 3 ceiling
     nerfstudio/transforms_undistorted.json  # PINHOLE intrinsics, original poses
 
 ``nvs_sem_train`` maps to subset ``train`` and ``nvs_sem_val`` to ``test`` to match
@@ -28,11 +29,14 @@ import numpy as np
 import open3d as o3d
 import torch
 from PIL import Image
+from plyfile import PlyData
 from pytorch3d.renderer import MeshRasterizer, RasterizationSettings, fisheyecameras
 from pytorch3d.structures import Meshes
 from pytorch3d.utils import cameras_from_opencv_projection
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
+
+from dvlt.scripts.preprocess.scannetpp.structure import face_structure_labels
 
 
 SPLIT_TO_SUBSET = {"nvs_sem_train": "train", "nvs_sem_val": "test"}
@@ -118,7 +122,7 @@ def encode_depth_png(path: Path, depth: np.ndarray) -> None:
 
 
 class ScanNetppProcessor:
-    """Render depth and undistort DSLR captures for a set of ScanNet++ splits.
+    """Render depth and structural masks, then undistort DSLR captures.
 
     Args:
         data_root: Raw release root containing ``data/`` and ``splits/``.
@@ -128,7 +132,6 @@ class ScanNetppProcessor:
         splits: Split names to process (subset of ``SPLIT_TO_SUBSET``).
         scene_ids: Optional explicit scene subset (default: all scenes in each split).
         device: Torch device for rasterization.
-        overwrite: Re-render scenes even if their outputs already exist.
         bin_size: PyTorch3D rasterization bin size (default: None, the safe heuristic).
         max_faces_per_bin: PyTorch3D per-bin face budget (default: None, the safe
             heuristic). The default is correct but slow; a smaller budget (with a
@@ -143,7 +146,6 @@ class ScanNetppProcessor:
         splits: List[str],
         scene_ids: Optional[List[str]] = None,
         device: str = "cuda",
-        overwrite: bool = False,
         bin_size: Optional[int] = None,
         max_faces_per_bin: Optional[int] = None,
     ):
@@ -152,7 +154,6 @@ class ScanNetppProcessor:
         self.splits = splits
         self.scene_ids = set(scene_ids) if scene_ids else None
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.overwrite = overwrite
         self.bin_size = bin_size
         self.max_faces_per_bin = max_faces_per_bin
 
@@ -188,13 +189,17 @@ class ScanNetppProcessor:
         out_dir = undistort_root / scene_id
         out_image_dir = out_dir / "undistorted_images"
         out_depth_dir = out_dir / "undistorted_depth"
+        out_structure_dir = out_dir / "struct_mask"
         out_transforms = out_dir / "nerfstudio" / "transforms_undistorted.json"
-
-        if not self.overwrite and out_transforms.exists() and any(out_image_dir.glob("*")):
-            return
 
         transforms = json.loads((scene_dir / "nerfstudio" / "transforms.json").read_text())
         frames = transforms["frames"] + transforms.get("test_frames", [])
+        poses = read_colmap_poses(scene_dir / "colmap" / "images.txt")
+        names = [
+            f["file_path"]
+            for f in frames
+            if f["file_path"] in poses and (scene_dir / "resized_images" / f["file_path"]).exists()
+        ]
 
         K = np.array(
             [
@@ -209,8 +214,8 @@ class ScanNetppProcessor:
         new_K = rectified_intrinsics(K, distortion, width, height)
         map1, map2 = cv2.fisheye.initUndistortRectifyMap(K, distortion, np.eye(3), new_K, (width, height), cv2.CV_32FC1)
 
-        poses = read_colmap_poses(scene_dir / "colmap" / "images.txt")
         mesh = self._load_mesh(scene_id)
+        face_structure = self._load_face_structure(scene_id, mesh)
         rasterizer = MeshRasterizer(
             raster_settings=RasterizationSettings(
                 image_size=(height, width),
@@ -224,12 +229,7 @@ class ScanNetppProcessor:
 
         out_image_dir.mkdir(parents=True, exist_ok=True)
         out_depth_dir.mkdir(parents=True, exist_ok=True)
-
-        names = [
-            f["file_path"]
-            for f in frames
-            if f["file_path"] in poses and (scene_dir / "resized_images" / f["file_path"]).exists()
-        ]
+        out_structure_dir.mkdir(parents=True, exist_ok=True)
 
         processed = 0
         for name in tqdm(names, desc=scene_id, unit="frame", leave=False):
@@ -237,11 +237,22 @@ class ScanNetppProcessor:
             rectified = cv2.remap(image, map1, map2, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
             cv2.imwrite(str(out_image_dir / name), rectified)
 
-            depth = self._render_depth(rasterizer, mesh, poses[name], K, distortion, height, width)
+            depth, structure_mask = self._render_depth_and_structure(
+                rasterizer, mesh, poses[name], K, distortion, height, width, face_structure
+            )
             rectified_depth = cv2.remap(
                 depth, map1, map2, interpolation=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0
             )
             encode_depth_png(out_depth_dir / (Path(name).stem + ".png"), rectified_depth)
+            rectified_structure = cv2.remap(
+                structure_mask,
+                map1,
+                map2,
+                interpolation=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            cv2.imwrite(str(out_structure_dir / (Path(name).stem + ".png")), rectified_structure)
             processed += 1
 
         self._write_transforms(transforms, new_K, out_transforms)
@@ -254,7 +265,20 @@ class ScanNetppProcessor:
         faces = torch.tensor(np.asarray(o3d_mesh.triangles), dtype=torch.int64, device=self.device)
         return Meshes(verts=[verts], faces=[faces])
 
-    def _render_depth(
+    def _load_face_structure(self, scene_id: str, mesh: Meshes) -> np.ndarray:
+        semantic_path = self.data_root / "data" / scene_id / "scans" / "mesh_aligned_0.05_semantic.ply"
+        vertex = PlyData.read(str(semantic_path))["vertex"].data
+        if "label" not in vertex.dtype.names:
+            raise ValueError(f"No vertex 'label' property in {semantic_path}")
+        if len(vertex) != mesh.verts_packed().shape[0]:
+            raise ValueError(f"Semantic and geometry vertex counts differ for {scene_id}")
+
+        classes_path = self.data_root / "metadata" / "semantic_classes.txt"
+        classes = [line.strip() for line in classes_path.read_text().splitlines() if line.strip()]
+        faces = mesh.faces_packed().cpu().numpy()
+        return face_structure_labels(vertex["label"], faces, classes)
+
+    def _render_depth_and_structure(
         self,
         rasterizer: MeshRasterizer,
         mesh: Meshes,
@@ -263,14 +287,19 @@ class ScanNetppProcessor:
         distortion: np.ndarray,
         height: int,
         width: int,
-    ) -> np.ndarray:
-        """Rasterize depth for one camera; returns metres."""
+        face_structure: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Rasterize metric depth and structural labels for one camera."""
         cameras = make_fisheye_camera(pose, K, distortion, height, width).to(self.device)
         with torch.no_grad():
-            zbuf = rasterizer(mesh, cameras=cameras).zbuf[0, :, :, 0]
-        depth = zbuf.cpu().numpy()
+            fragments = rasterizer(mesh, cameras=cameras)
+        depth = fragments.zbuf[0, :, :, 0].cpu().numpy()
         depth[depth == -1] = 0.0  # pixels with no mesh hit
-        return depth
+        face_index = fragments.pix_to_face[0, :, :, 0].cpu().numpy()
+        structure_mask = np.zeros(face_index.shape, dtype=np.uint8)
+        valid = face_index >= 0
+        structure_mask[valid] = face_structure[face_index[valid]]
+        return depth, structure_mask
 
     @staticmethod
     def _write_transforms(transforms: dict, new_K: np.ndarray, out_path: Path) -> None:
